@@ -72,6 +72,7 @@
 #include <session.h> // QtOlm
 
 using namespace Quotient;
+using namespace QtOlm;
 using namespace std::placeholders;
 using std::move;
 #if !(defined __GLIBCXX__ && __GLIBCXX__ <= 20150123)
@@ -332,6 +333,31 @@ public:
     void setTags(TagsMap newTags);
 
     QJsonObject toJson() const;
+
+    // A map from senderKey to InboundSession
+    QMap<QString, InboundSession*> sessions; // TODO: cache
+    // A map from senderKey to a map of sessionId to InboundGroupSession
+    // Not using QMultiHash, because we want to quickly return
+    // a number of relations for a given event without enumerating them.
+    QHash<QPair<QString, QString>, InboundGroupSession*> groupSessions; // TODO: cache
+    bool addInboundGroupSession(QString senderKey, QString sessionId, QString sessionKey)
+    {
+        if (groupSessions.contains({ senderKey, sessionId }))
+        {
+            qDebug(MAIN) << "Inbound Megolm session" << sessionId
+                         << "with senderKey" << senderKey << "already exists";
+            return false;
+        }
+
+        InboundGroupSession* megolmSession = new InboundGroupSession(sessionKey.toLatin1(), InboundGroupSession::Init);
+        if (megolmSession->id() != sessionId)
+        {
+            qCWarning(MAIN) << "Session ID mismatch in m.room_key event sent from sender with key" << senderKey;
+            return false;
+        }
+        groupSessions.insert({ senderKey, sessionId }, megolmSession);
+        return true;
+    }
 
 private:
     using users_shortlist_t = std::array<User*, 3>;
@@ -1130,6 +1156,8 @@ const RoomEvent* Room::decryptMessage(EncryptedEvent* encryptedEvent) const
                                   encryptedEvent->sessionId()))
             .get();
     }
+    qCDebug(EVENTS) << "Algorithm of the encrypted event with id" << encryptedEvent->id()
+                    << "is not for the current device";
     return nullptr;
 }
 
@@ -1138,45 +1166,42 @@ const QString Room::decryptMessage(QJsonObject personalCipherObject,
 {
     QString decrypted;
 
-    using namespace QtOlm;
-    // TODO: new objects to private fields:
-    InboundSession* session;
-
     int type = personalCipherObject.value(TypeKeyL).toInt(-1);
     QByteArray body = personalCipherObject.value(BodyKeyL).toString().toLatin1();
-
-    PreKeyMessage* preKeyMessage = new PreKeyMessage(body);
-    session = new InboundSession(connection()->olmAccount(), preKeyMessage,
-                                 senderKey);
+    /*d->inboundSession.reset(new InboundSession(connection()->olmAccount(), preKeyMessage,
+                                 senderKey));*/
     if (type == 0) {
-        if (!session->matches(preKeyMessage, senderKey)) {
-            connection()->olmAccount()->removeOneTimeKeys(session);
+        /*
+        if (!d->inboundSession->matches(preKeyMessage, senderKey)) {
+            connection()->olmAccount()->removeOneTimeKeys(d->inboundSession.get());
         }
         try {
-            decrypted = session->decrypt(preKeyMessage);
+            decrypted = d->inboundSession->decrypt(preKeyMessage);
         } catch (std::runtime_error& e) {
             qWarning(EVENTS) << "Decrypt failed:" << e.what();
         }
+        */
+        //decrypted =
+        PreKeyMessage* preKeyMessage = new PreKeyMessage(body);
+        auto senderSessions = d->sessions.values(senderKey);
+        for (auto senderSessionsIt = senderSessions.begin(); senderSessionsIt != senderSessions.end(); ++senderSessionsIt ) {
+            // (*senderSessionsIt)->decrypt();
+        }
     } else if (type == 1) {
+        /*
         Message* message = new Message(body);
-        if (!session->matches(preKeyMessage, senderKey)) {
+        if (!d->inboundSession->matches(preKeyMessage, senderKey)) {
             qWarning(EVENTS) << "Invalid encrypted message";
         }
         try {
-            decrypted = session->decrypt(message);
+            decrypted = d->inboundSession->decrypt(message);
         } catch (std::runtime_error& e) {
             qWarning(EVENTS) << "Decrypt failed:" << e.what();
         }
+        */
     }
 
     return decrypted;
-}
-
-const QString Room::sessionKey(const QString& senderKey, const QString& deviceId,
-                               const QString& sessionId) const
-{
-    // TODO: handling an m.room_key event
-    return "";
 }
 
 const QString Room::decryptMessage(QByteArray cipher, const QString& senderKey,
@@ -1184,13 +1209,23 @@ const QString Room::decryptMessage(QByteArray cipher, const QString& senderKey,
                                    const QString& sessionId) const
 {
     QString decrypted;
-    using namespace QtOlm;
-    InboundGroupSession* groupSession;
-    groupSession = new InboundGroupSession(
-        sessionKey(senderKey, deviceId, sessionId).toLatin1());
-    groupSession->decrypt(cipher);
-    // TODO:  avoid replay attacks
+    /*
+    d->inboundGroupSession.reset(new InboundGroupSession(
+        sessionKey(senderKey, deviceId, sessionId).toLatin1())); // FIXME: alexey
+    d->inboundGroupSession->decrypt(cipher);
+    // TODO: avoid replay attacks
+    */
     return decrypted;
+}
+
+void Room::handleRoomKeyEvent(RoomKeyEvent *roomKeyEvent, QString senderKey)
+{
+    if (roomKeyEvent->algorithm() != MegolmV1AesSha2AlgoKey)
+    {
+        qCWarning(MAIN) << "Ignoring unsupported algorithm" << roomKeyEvent->algorithm()
+                        << "in m.room_key event";
+    }
+    d->addInboundGroupSession(senderKey, roomKeyEvent->sessionId(), roomKeyEvent->sessionKey());
 }
 
 int Room::joinedCount() const

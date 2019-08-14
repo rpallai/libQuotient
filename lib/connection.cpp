@@ -509,6 +509,38 @@ void Connection::onSyncSuccess(SyncData&& data, bool fromCache)
         d->dcLocalAdditions.clear();
         d->dcLocalRemovals.clear();
     }
+    // handling m.room_key to-device encrypted event
+    Events&& toDeviceEvents = data.takeToDeviceEvents();
+    for (auto toDeviceIt = toDeviceEvents.begin(); toDeviceIt != toDeviceEvents.end(); ++toDeviceIt) {
+        Event* toDeviceEvent = toDeviceIt->get();
+        if (toDeviceEvent->type() == EncryptedEvent::typeId()) {
+            event_ptr_tt<EncryptedEvent> encryptedEvent = makeEvent<EncryptedEvent>(toDeviceEvent->fullJson());
+            if (!SupportedAlgorithms.contains(encryptedEvent->algorithm()))
+            {
+                qCDebug(MAIN) << "Encrypted event" << encryptedEvent->id() << "algorithm"
+                              << encryptedEvent->algorithm() << "is not supported";
+                return;
+            }
+            Room* detectedRoom = room(encryptedEvent->roomId());
+            if (!detectedRoom)
+            {
+                qCDebug(MAIN) << "Encrypted event room id" << encryptedEvent->roomId()
+                              << "is not found at the connection";
+                return;
+            }
+            const RoomEvent* decryptedEvent = detectedRoom->decryptMessage(encryptedEvent.get());
+            if (!decryptedEvent)
+            {
+                qCDebug(MAIN) << "Failed to decrypt event" << encryptedEvent->id();
+                return;
+            }
+            if (decryptedEvent->type() == RoomKeyEvent::typeId())
+            {
+                event_ptr_tt<RoomKeyEvent> roomKeyEvent = makeEvent<RoomKeyEvent>(decryptedEvent->fullJson());
+                detectedRoom->handleRoomKeyEvent(roomKeyEvent.get(), encryptedEvent->senderKey());
+            }
+        }
+    }
 }
 
 void Connection::stopSync()
