@@ -358,6 +358,72 @@ public:
         groupSessions.insert({ senderKey, sessionId }, megolmSession);
         return true;
     }
+    const QString olmDecrypt(Message* message, const QString& senderKey)
+    {
+        QString decrypted;
+        QList<InboundSession*> senderSessions = sessions.values(senderKey);
+        // Try to decrypt message body using one of the known sessions for that device
+        bool sessionsPassed = false;
+        for (auto senderSession : senderSessions) {
+            if (senderSession == senderSessions.last())
+            {
+                sessionsPassed = true;
+            }
+            try {
+                decrypted = senderSession->decrypt(message);
+                qCDebug(MAIN) << "Success decrypting Olm event using existing session" << senderSession->id();
+                break;
+            } catch (std::runtime_error& e) {
+                if (message->messageType() == 0)
+                {
+                    PreKeyMessage preKeyMessage = PreKeyMessage(message->cipherText());
+                    if (senderSession->matches(&preKeyMessage, senderKey))
+                    {
+                        // We had a matching session for a pre-key message, but it didn't work.
+                        // This means something is wrong, so we fail now.
+                        qCDebug(MAIN) << "Error decrypting pre-key message with existing Olm session" << senderSession->id()
+                                         << "reason:" << e.what();
+                        return decrypted;
+                    }
+                }
+                // Simply keep trying otherwise
+            }
+        }
+        if (sessionsPassed)
+        {
+            if (message->messageType() > 0)
+            {
+                // Not a pre-key message, we should have had a matching session
+                if (!sessions.empty())
+                {
+                    qCDebug(MAIN) << "Error decrypting with existing sessions";
+                    return decrypted;
+                }
+                qCDebug(MAIN) << "No existing sessions";
+                return decrypted;
+            }
+            // We have a pre-key message without any matching session, in this case we should try to create one.
+            InboundSession* newSession;
+            try {
+                PreKeyMessage preKeyMessage = PreKeyMessage(message->cipherText());
+                // FIXME: possible memory leaks?
+                newSession = new InboundSession(connection->olmAccount(), &preKeyMessage, senderKey.toLatin1());
+            } catch (std::runtime_error& e) {
+                qCDebug(MAIN) << "Error decrypting pre-key message when trying to establish a new session:" << e.what();
+                return decrypted;
+            }
+            qCDebug(MAIN) << "Created new Olm session" << newSession->id();
+            try {
+                decrypted = newSession->decrypt(message);
+            } catch (std::runtime_error& e) {
+                qCDebug(MAIN) << "Error decrypting pre-key message with new session" << e.what();
+                return decrypted;
+            }
+            connection->olmAccount()->removeOneTimeKeys(newSession);
+            sessions.insert(senderKey, newSession);
+        }
+        return decrypted;
+    }
 
 private:
     using users_shortlist_t = std::array<User*, 3>;
@@ -1133,7 +1199,7 @@ bool Room::usesEncryption() const
     return !d->getCurrentState<EncryptionEvent>()->algorithm().isEmpty();
 }
 
-const RoomEvent* Room::decryptMessage(EncryptedEvent* encryptedEvent) const
+const RoomEvent* Room::decryptMessage(EncryptedEvent* encryptedEvent, const QString& userId) const
 {
     if (encryptedEvent->algorithm() == OlmV1Curve25519AesSha2AlgoKey) {
         QString identityKey = connection()->olmAccount()->curve25519IdentityKey();
@@ -1149,12 +1215,35 @@ const RoomEvent* Room::decryptMessage(EncryptedEvent* encryptedEvent) const
             .get();
     }
     if (encryptedEvent->algorithm() == MegolmV1AesSha2AlgoKey) {
-        return makeEvent<RoomMessageEvent>(
+
+        RoomMessageEvent* decryptedEvent = makeEvent<RoomMessageEvent>(
                    decryptMessage(encryptedEvent->ciphertext(),
                                   encryptedEvent->senderKey(),
                                   encryptedEvent->deviceId(),
                                   encryptedEvent->sessionId()))
             .get();
+        if (decryptedEvent->senderId() != userId)
+        {
+            qCDebug(EVENTS) << "Found user" << decryptedEvent->senderId()
+                            << "instead of sender" << userId << "in Olm plaintext";
+            return nullptr;
+        }
+        QJsonObject decryptedEventObject = decryptedEvent->fullJson();
+        // TODO: keys to constants
+        QString recipient = decryptedEventObject.value("recipient"_ls).toString();
+        if (recipient != localUser()->id())
+        {
+            qCDebug(EVENTS) << "Found user" << recipient
+                            << "instead of us" << localUser()->id() << "in Olm plaintext";
+            return nullptr;
+        }
+        QString ourKey = decryptedEventObject.value("recipient_keys"_ls).toObject().value(Ed25519Key).toString();
+        if (ourKey.toLatin1() != connection()->olmAccount()->ed25519IdentityKey())
+        {
+            qCDebug(EVENTS) << "Found key" << ourKey
+                            << "instead of ours own ed25519 key" << connection()->olmAccount()->ed25519IdentityKey() << "in Olm plaintext";
+            return nullptr;
+        }
     }
     qCDebug(EVENTS) << "Algorithm of the encrypted event with id" << encryptedEvent->id()
                     << "is not for the current device";
@@ -1165,42 +1254,15 @@ const QString Room::decryptMessage(QJsonObject personalCipherObject,
                                    QByteArray senderKey) const
 {
     QString decrypted;
-
     int type = personalCipherObject.value(TypeKeyL).toInt(-1);
     QByteArray body = personalCipherObject.value(BodyKeyL).toString().toLatin1();
-    /*d->inboundSession.reset(new InboundSession(connection()->olmAccount(), preKeyMessage,
-                                 senderKey));*/
     if (type == 0) {
-        /*
-        if (!d->inboundSession->matches(preKeyMessage, senderKey)) {
-            connection()->olmAccount()->removeOneTimeKeys(d->inboundSession.get());
-        }
-        try {
-            decrypted = d->inboundSession->decrypt(preKeyMessage);
-        } catch (std::runtime_error& e) {
-            qWarning(EVENTS) << "Decrypt failed:" << e.what();
-        }
-        */
-        //decrypted =
         PreKeyMessage* preKeyMessage = new PreKeyMessage(body);
-        auto senderSessions = d->sessions.values(senderKey);
-        for (auto senderSessionsIt = senderSessions.begin(); senderSessionsIt != senderSessions.end(); ++senderSessionsIt ) {
-            // (*senderSessionsIt)->decrypt();
-        }
+        decrypted = d->olmDecrypt(reinterpret_cast<Message*>(preKeyMessage), senderKey);
     } else if (type == 1) {
-        /*
         Message* message = new Message(body);
-        if (!d->inboundSession->matches(preKeyMessage, senderKey)) {
-            qWarning(EVENTS) << "Invalid encrypted message";
-        }
-        try {
-            decrypted = d->inboundSession->decrypt(message);
-        } catch (std::runtime_error& e) {
-            qWarning(EVENTS) << "Decrypt failed:" << e.what();
-        }
-        */
+        decrypted = d->olmDecrypt(message, senderKey);
     }
-
     return decrypted;
 }
 

@@ -528,7 +528,7 @@ void Connection::onSyncSuccess(SyncData&& data, bool fromCache)
                               << "is not found at the connection";
                 return;
             }
-            const RoomEvent* decryptedEvent = detectedRoom->decryptMessage(encryptedEvent.get());
+            const RoomEvent* decryptedEvent = detectedRoom->decryptMessage(encryptedEvent.get(), toDeviceEvent->fullJson().value("sender"_ls).toString());
             if (!decryptedEvent)
             {
                 qCDebug(MAIN) << "Failed to decrypt event" << encryptedEvent->id();

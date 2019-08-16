@@ -192,7 +192,7 @@ public:
     memberCount() const;
     int timelineSize() const;
     bool usesEncryption() const;
-    const RoomEvent* decryptMessage(EncryptedEvent* encryptedEvent) const;
+    const RoomEvent* decryptMessage(EncryptedEvent* encryptedEvent, const QString &userId) const;
     const QString decryptMessage(QJsonObject personalCipherObject,
                                  QByteArray senderKey) const;
     const QString decryptMessage(QByteArray cipher, const QString& senderKey,
