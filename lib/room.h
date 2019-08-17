@@ -196,8 +196,8 @@ public:
     const QString decryptMessage(QJsonObject personalCipherObject,
                                  QByteArray senderKey) const;
     const QString decryptMessage(QByteArray cipher, const QString& senderKey,
-                                 const QString& deviceId,
-                                 const QString& sessionId) const;
+                                 const QString& sessionId,
+                                 const QString& eventId, QDateTime originServerTs) const;
     void handleRoomKeyEvent(RoomKeyEvent* roomKeyEvent, QString senderKey);
     int joinedCount() const;
     int invitedCount() const;

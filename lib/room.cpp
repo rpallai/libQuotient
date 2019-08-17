@@ -336,6 +336,8 @@ public:
 
     // A map from senderKey to InboundSession
     QMap<QString, InboundSession*> sessions; // TODO: cache
+    // A map from <sessionId, messageIndex> to <event_id, origin_server_ts>
+    QHash<QPair<QString, uint32_t>, QPair<QString, QDateTime>> groupSessionIndexRecord; // TODO: cache
     // A map from senderKey to a map of sessionId to InboundGroupSession
     // Not using QMultiHash, because we want to quickly return
     // a number of relations for a given event without enumerating them.
@@ -358,7 +360,7 @@ public:
         groupSessions.insert({ senderKey, sessionId }, megolmSession);
         return true;
     }
-    const QString olmDecrypt(Message* message, const QString& senderKey)
+    const QString sessionDecrypt(Message* message, const QString& senderKey)
     {
         QString decrypted;
         QList<InboundSession*> senderSessions = sessions.values(senderKey);
@@ -369,7 +371,8 @@ public:
             {
                 sessionsPassed = true;
             }
-            try {
+            try
+            {
                 decrypted = senderSession->decrypt(message);
                 qCDebug(MAIN) << "Success decrypting Olm event using existing session" << senderSession->id();
                 break;
@@ -383,7 +386,7 @@ public:
                         // This means something is wrong, so we fail now.
                         qCDebug(MAIN) << "Error decrypting pre-key message with existing Olm session" << senderSession->id()
                                          << "reason:" << e.what();
-                        return decrypted;
+                        return QString();
                     }
                 }
                 // Simply keep trying otherwise
@@ -397,27 +400,29 @@ public:
                 if (!sessions.empty())
                 {
                     qCDebug(MAIN) << "Error decrypting with existing sessions";
-                    return decrypted;
+                    return QString();
                 }
                 qCDebug(MAIN) << "No existing sessions";
-                return decrypted;
+                return QString();
             }
             // We have a pre-key message without any matching session, in this case we should try to create one.
             InboundSession* newSession;
-            try {
+            try
+            {
                 PreKeyMessage preKeyMessage = PreKeyMessage(message->cipherText());
                 // FIXME: possible memory leaks?
                 newSession = new InboundSession(connection->olmAccount(), &preKeyMessage, senderKey.toLatin1());
             } catch (std::runtime_error& e) {
                 qCDebug(MAIN) << "Error decrypting pre-key message when trying to establish a new session:" << e.what();
-                return decrypted;
+                return QString();
             }
             qCDebug(MAIN) << "Created new Olm session" << newSession->id();
-            try {
+            try
+            {
                 decrypted = newSession->decrypt(message);
             } catch (std::runtime_error& e) {
                 qCDebug(MAIN) << "Error decrypting pre-key message with new session" << e.what();
-                return decrypted;
+                return QString();
             }
             connection->olmAccount()->removeOneTimeKeys(newSession);
             sessions.insert(senderKey, newSession);
@@ -1219,8 +1224,9 @@ const RoomEvent* Room::decryptMessage(EncryptedEvent* encryptedEvent, const QStr
         RoomMessageEvent* decryptedEvent = makeEvent<RoomMessageEvent>(
                    decryptMessage(encryptedEvent->ciphertext(),
                                   encryptedEvent->senderKey(),
-                                  encryptedEvent->deviceId(),
-                                  encryptedEvent->sessionId()))
+                                  encryptedEvent->sessionId(),
+                                  encryptedEvent->id(),
+                                  encryptedEvent->timestamp()))
             .get();
         if (decryptedEvent->senderId() != userId)
         {
@@ -1258,26 +1264,46 @@ const QString Room::decryptMessage(QJsonObject personalCipherObject,
     QByteArray body = personalCipherObject.value(BodyKeyL).toString().toLatin1();
     if (type == 0) {
         PreKeyMessage* preKeyMessage = new PreKeyMessage(body);
-        decrypted = d->olmDecrypt(reinterpret_cast<Message*>(preKeyMessage), senderKey);
+        decrypted = d->sessionDecrypt(reinterpret_cast<Message*>(preKeyMessage), senderKey);
     } else if (type == 1) {
         Message* message = new Message(body);
-        decrypted = d->olmDecrypt(message, senderKey);
+        decrypted = d->sessionDecrypt(message, senderKey);
     }
     return decrypted;
 }
 
 const QString Room::decryptMessage(QByteArray cipher, const QString& senderKey,
-                                   const QString& deviceId,
-                                   const QString& sessionId) const
+                                   const QString& sessionId, const QString& eventId, QDateTime timestamp) const
 {
-    QString decrypted;
-    /*
-    d->inboundGroupSession.reset(new InboundGroupSession(
-        sessionKey(senderKey, deviceId, sessionId).toLatin1())); // FIXME: alexey
-    d->inboundGroupSession->decrypt(cipher);
-    // TODO: avoid replay attacks
-    */
-    return decrypted;
+    std::pair<QString, uint32_t> decrypted;
+    InboundGroupSession* senderSession = d->groupSessions.value(qMakePair(senderKey, sessionId));
+    if (!senderSession)
+    {
+        qCDebug(MAIN) << "Unable to decrypt event" << eventId
+                      << "The sender's device has not sent us the keys for this message";
+        return QString();
+    }
+    try
+    {
+        decrypted = senderSession->decrypt(cipher);
+    } catch (std::runtime_error& e) {
+        qCDebug(MAIN) << "Unable to decrypt event" << eventId
+                         << "with matching megolm session:" << e.what();
+        return QString();
+    }
+    QPair<QString, QDateTime> properties = d->groupSessionIndexRecord.value(qMakePair(senderSession->id(), decrypted.second));
+    if (properties.first.isEmpty())
+    {
+        d->groupSessionIndexRecord.insert(qMakePair(senderSession->id(),decrypted.second),qMakePair(eventId, timestamp));
+    } else {
+        if ((properties.first != eventId)|| (properties.second != timestamp))
+        {
+            qCDebug(MAIN) << "Detected a replay attack on event" << eventId;
+            return QString();
+        }
+    }
+
+    return decrypted.first;
 }
 
 void Room::handleRoomKeyEvent(RoomKeyEvent *roomKeyEvent, QString senderKey)
